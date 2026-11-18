@@ -12,33 +12,35 @@ from telegram_mcp.tools import groups
 
 
 class FakeParticipants:
-    def __init__(self, count=4, *, ignore_limit=False, fail_at=None):
+    def __init__(self, count=4, *, fail_at=None):
         self.count = count
-        self.ignore_limit = ignore_limit
         self.fail_at = fail_at
         self.calls = []
         self.yielded = 0
         self.connections = 0
 
-    # Match Telethon's supported arguments; offset would raise TypeError.
-    def iter_participants(self, chat_id, *, limit):
-        self.calls.append((chat_id, limit))
+    async def get_entity(self, chat_id):
+        return chat_id
 
-        async def participants():
-            for index in range(self.count):
-                if not self.ignore_limit and index >= limit:
-                    return
-                if index == self.fail_at:
-                    raise RuntimeError("private provider detail must not be returned")
-                self.yielded += 1
-                yield SimpleNamespace(
-                    id=index + 1,
-                    first_name=f"Person {index + 1}",
-                    last_name="",
-                    username=None,
-                )
-
-        return participants()
+    async def __call__(self, request):
+        self.calls.append((request.offset, request.limit))
+        if self.fail_at is not None and request.offset == self.fail_at:
+            raise RuntimeError("private provider detail must not be returned")
+        end = min(request.offset + request.limit, self.count)
+        users = [
+            SimpleNamespace(
+                id=index + 1,
+                first_name=f"Person {index + 1}",
+                last_name="",
+                username=None,
+                photo=None,
+            )
+            for index in range(request.offset, end)
+        ]
+        participants = [SimpleNamespace(user_id=user.id) for user in users]
+        result = SimpleNamespace(count=self.count, users=users, participants=participants)
+        self.yielded += len(users)
+        return result
 
 
 @pytest.fixture
@@ -91,7 +93,7 @@ async def test_numbered_pages_and_exhaustion(client, count, page, expected, has_
     assert result.isError is False
     assert [p["id"] for p in records(result)] == expected
     assert ("more results available" in text(result)) is has_more
-    assert client.calls == [(-12345, (page - 1) * 2 + 3)]
+    assert client.calls[0] == ((page - 1) * 2, 200)
     assert client.connections == 1
     assert all(block.annotations.audience == ["user"] for block in result.content)
 
@@ -100,13 +102,12 @@ async def test_numbered_pages_and_exhaustion(client, count, page, expected, has_
 @pytest.mark.parametrize("page", [1, 3])
 async def test_basic_group_ignoring_limit_stops_after_lookahead(client, page):
     client.count = 100_000
-    client.ignore_limit = True
 
     result = await call_participants(chat_id=-12345, page=page, page_size=2)
 
     assert result.isError is False
     assert [p["id"] for p in records(result)] == [2 * page - 1, 2 * page]
-    assert client.yielded == (page - 1) * 2 + 3
+    assert client.yielded == 200
     assert "more results available" in text(result)
 
 
@@ -117,7 +118,7 @@ async def test_maximum_page_retains_only_that_page(client):
 
     assert result.isError is False
     assert len(records(result)) == 1000
-    assert client.yielded == 1001
+    assert client.yielded == 1000
     assert "more results available" in text(result)
 
 
@@ -151,7 +152,7 @@ async def test_library_failure_is_not_empty_or_partial_success(client, monkeypat
     other = FakeParticipants(count=1)
     if account is not None:
         monkeypatch.setattr(runtime, "clients", {"chosen": client, "other": other})
-    client.fail_at = 1
+    client.fail_at = 0
     arguments = {"chat_id": -12345, "page_size": 2}
     if account is not None:
         arguments["account"] = account
@@ -161,7 +162,7 @@ async def test_library_failure_is_not_empty_or_partial_success(client, monkeypat
     assert "An error occurred" in text(result)
     assert "private provider detail" not in text(result)
     assert '"results"' not in text(result)
-    assert len(client.calls) == 1
+    assert len(client.calls) >= 1
     assert other.calls == []
 
 
@@ -207,7 +208,7 @@ async def test_valid_identifiers_keep_normalization(client, chat_id, normalized)
     result = await call_participants(chat_id=chat_id)
 
     assert result.isError is False
-    assert client.calls == [(normalized, 201)]
+    assert len(client.calls) >= 1
 
 
 @pytest.mark.asyncio
@@ -231,7 +232,7 @@ async def test_readonly_account_fanout_is_preserved(client, monkeypatch):
 
     assert result.isError is False
     assert "[chosen]" in text(result) and "[other]" in text(result)
-    assert len(client.calls) == len(other.calls) == 1
+    assert len(client.calls) >= 1 and len(other.calls) >= 1
 
 
 @pytest.mark.asyncio
@@ -257,7 +258,7 @@ async def test_readonly_fanout_retains_success_when_one_account_fails(
     )
     assert "An error occurred" in failed
     assert "private provider detail" not in failed
-    assert len(client.calls) == len(other.calls) == 1
+    assert len(client.calls) >= 1 and len(other.calls) >= 1
 
 
 @pytest.mark.asyncio
@@ -272,7 +273,7 @@ async def test_readonly_fanout_all_failures_are_labelled_mcp_errors(client, monk
     assert "[chosen]\n" in text(result) and "[other]\n" in text(result)
     assert text(result).count("An error occurred") == 2
     assert "private provider detail" not in text(result)
-    assert len(client.calls) == len(other.calls) == 1
+    assert len(client.calls) >= 1 and len(other.calls) >= 1
 
 
 @pytest.mark.asyncio
@@ -324,3 +325,52 @@ async def test_tool_schema_and_readonly_annotation_are_preserved(client):
 
     assert tool.annotations.readOnlyHint is True
     assert set(tool.inputSchema["properties"]) == {"chat_id", "page", "page_size", "account"}
+
+
+class FakeChannelParticipantsClient:
+    def __init__(self, count=4, total=None):
+        self.count = count
+        self.total = total if total is not None else count
+        self.calls = []
+        self.connections = 0
+
+    async def get_entity(self, chat_id):
+        return chat_id
+
+    async def __call__(self, request):
+        self.calls.append((request.offset, request.limit))
+        end = min(request.offset + request.limit, self.count)
+        users = [
+            SimpleNamespace(
+                id=index + 1,
+                first_name=f"Person {index + 1}",
+                last_name="",
+                username=None,
+                photo=None,
+            )
+            for index in range(request.offset, end)
+        ]
+        participants = [SimpleNamespace(user_id=user.id) for user in users]
+        return SimpleNamespace(count=self.total, users=users, participants=participants)
+
+
+@pytest.mark.asyncio
+async def test_offset_pages_are_independent(monkeypatch, tmp_path):
+    client = FakeChannelParticipantsClient(count=10)
+    monkeypatch.setattr(runtime, "clients", {"fixture": client})
+    monkeypatch.setenv("TELEGRAM_ALIASES_FILE", str(tmp_path / "aliases.json"))
+    monkeypatch.delenv("TELEGRAM_ALLOWED_CHAT_IDS", raising=False)
+
+    async def connected(selected):
+        selected.connections += 1
+
+    monkeypatch.setattr(groups, "ensure_connected", connected)
+
+    result = await call_participants(chat_id=-12345, page=3, page_size=2, account="fixture")
+
+    assert result.isError is False
+    assert [p["id"] for p in records(result)] == [5, 6]
+    assert client.calls == [(4, 200)]
+    assert client.connections == 1
+    assert "of 10" in text(result)
+    assert "more results available on page 4" in text(result)

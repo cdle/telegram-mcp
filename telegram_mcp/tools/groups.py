@@ -338,39 +338,76 @@ async def get_participants(
         if is_chat_blocklist_enabled():
             chat_id = await resolve_entity(chat_id, cl)
 
-        # Skip the prefix without retaining it. Basic groups can ignore limit,
-        # so explicitly stop once one extra participant proves a next page.
-        skip = (page - 1) * page_size
+        offset = (page - 1) * page_size
+        seen = set()
         participants = []
-        has_more = False
-        async for participant in cl.iter_participants(chat_id, limit=skip + page_size + 1):
-            if skip:
-                skip -= 1
-                continue
-            if len(participants) == page_size:
-                has_more = True
+        total = None
+        for _ in range(100):
+            response = await cl(
+                functions.channels.GetParticipantsRequest(
+                    channel=chat_id,
+                    filter=types.ChannelParticipantsRecent(),
+                    offset=offset,
+                    limit=200,
+                    hash=0,
+                )
+            )
+            total = response.count
+            if not response.participants:
                 break
-            participants.append(participant)
 
+            users = {user.id: user for user in response.users}
+            for participant in response.participants:
+                if isinstance(participant, types.ChannelParticipantLeft):
+                    continue
+                if isinstance(participant, types.ChannelParticipantBanned):
+                    if not isinstance(participant.peer, types.PeerUser):
+                        continue
+                    user_id = participant.peer.user_id
+                else:
+                    user_id = participant.user_id
+
+                if user_id in seen:
+                    continue
+                user = users.get(user_id)
+                if user is None:
+                    continue
+                seen.add(user_id)
+                participants.append(user)
+
+            offset += len(response.participants)
+            if len(participants) >= page_size:
+                break
+
+        participants = participants[:page_size]
         if not participants:
             return format_tool_result([])
 
         records = []
-        for p in participants:
-            rec = {
-                "id": p.id,
-                "name": sanitize_name(person_name(p)),
+        for participant in participants:
+            photo = getattr(participant, "photo", None)
+            photo_id = getattr(photo, "photo_id", None)
+            record = {
+                "id": participant.id,
+                "name": sanitize_name(person_name(participant)),
+                "avatar_id": photo_id,
+                "has_avatar": photo_id is not None,
+                "avatar_dc_id": getattr(photo, "dc_id", None),
+                "avatar_thumb": getattr(photo, "stripped_thumb", None).hex()
+                if getattr(photo, "stripped_thumb", None)
+                else None,
             }
-            uname = getattr(p, "username", None)
-            if uname:
-                rec["username"] = sanitize_name(uname)
-            records.append(rec)
+            username = getattr(participant, "username", None)
+            if username:
+                record["username"] = sanitize_name(username)
+            records.append(record)
         result = format_tool_result(records)
 
-        # Only an actual extra participant establishes another page.
         result += f"\n\nPage {page} (showing {len(participants)} participants)"
-        if has_more:
-            result += f" — more results available on page {page + 1}"
+        if total is not None:
+            result += f" of {total}"
+            if page * page_size < total:
+                result += f" — more results available on page {page + 1}"
 
         return result
     except Exception as e:
